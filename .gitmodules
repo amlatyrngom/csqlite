@@ -1,0 +1,4 @@
+[submodule "obelisk"]
+	path = obelisk
+	url = https://amlatyrngom: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@github.com/amlatyrngom/obelisk.git
+	branch = postpaper

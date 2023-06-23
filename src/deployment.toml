@@ -1,0 +1,21 @@
+namespace = "csqlite"
+dependencies = ["wal", "functional"]
+
+
+[[handlers]]
+name = "dbactor"
+subsystem = "functional"
+path = "csqlite::CSqliteActor"
+mem = 512
+timeout = 30
+persistent = true
+unique = true
+scaleup = true
+
+# [[handlers]]
+# name = "dbbench"
+# subsystem = "functional"
+# path = "csqlite::CsqliteBench"
+# mem = 512
+# timeout = 60
+# scaleup = false
