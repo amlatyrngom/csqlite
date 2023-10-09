@@ -1,0 +1,10 @@
+**/target
+**/.function_build
+**/.obelisk_build
+**/obelisk_shared_data
+**/.venv
+**/venv
+**/.ipynb_checkpoints
+pitch.md
+**/*.zip
+essai.md

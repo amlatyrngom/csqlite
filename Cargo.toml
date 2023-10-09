@@ -1,0 +1,30 @@
+[package]
+name = "csqlite"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+obelisk = {path="./obelisk"}
+obelisk_deployment = {package="deployment", path="./obelisk/deployment"}
+tokio = { version = "*", features = ["full"] }
+async-trait = "*"
+serde_json = "*"
+serde = {version="*", features = ["derive"]}
+bincode = "*"
+rusqlite = { version = "*", features = ["bundled"] }
+r2d2 = "*"
+r2d2_sqlite = "*"
+# sled = "*"
+
+[dependencies.rocksdb]
+version = "0.21"
+default-features = false
+features = ["lz4", "multi-threaded-cf"]
+
+[dev-dependencies]
+csv = "*"
+rand = "*"
+zipf = "*"
+

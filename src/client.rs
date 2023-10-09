@@ -11,6 +11,12 @@ pub struct DBClient {
     caller_mem: i32,
 }
 
+/// Client.
+#[derive(Clone)]
+pub struct KVClient {
+    fc: Arc<FunctionalClient>,
+}
+
 /// A txn.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct DBTxn {
@@ -20,19 +26,26 @@ pub struct DBTxn {
     pub caller_mem: i32,
 }
 
-/// Op.
+/// A key value store transaction.
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub enum DBOp {
-    Txn(DBTxn),
-    Query(String),
+pub struct KVTxn {
+    pub conditions: Vec<(String, Option<String>)>,
+    pub updates: Vec<(String, Option<String>)>,
+    pub reads: Vec<String>,
 }
 
-
+/// A Response.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub enum DBResp {
     Ok,
     Err(String),
-    Rows,
+}
+
+/// A Response.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub enum KVResp {
+    Ok,
+    Err(String),
 }
 
 impl DBClient {
@@ -45,25 +58,6 @@ impl DBClient {
             fc: Arc::new(fc),
             caller_mem: caller_mem.unwrap(),
         }
-    }
-
-    /// Send operation.
-    async fn send_op(&self, dbop: DBOp) -> Result<Vec<Vec<Value>>, String> {
-        let payload = serde_json::to_vec(&dbop).unwrap();
-        let (resp_meta, resp_payload) = self.fc.invoke("", &payload).await?;
-        let resp_meta: DBResp = serde_json::from_str(&resp_meta).unwrap();
-        println!("Resp Payload: {}.", resp_payload.len());
-        match resp_meta {
-            DBResp::Ok => Ok(vec![]),
-            DBResp::Err(s) => Err(s),
-            DBResp::Rows => Ok(bincode::deserialize(&resp_payload).unwrap()),
-        }
-    }
-
-    /// Snapshot query.
-    pub async fn snapshot_query(&self, query: &str) -> Result<Vec<Vec<Value>>, String> {
-        let dbop = DBOp::Query(query.into());
-        self.send_op(dbop).await
     }
 
     /// Perform a txn.
@@ -79,16 +73,59 @@ impl DBClient {
             query,
             caller_mem: self.caller_mem,
         };
-        let dbop = DBOp::Txn(dbtxn);
-        self.send_op(dbop).await
+        let payload = serde_json::to_vec(&dbtxn).unwrap();
+        let (resp_meta, resp_payload) = self.fc.invoke("", &payload).await?;
+        let resp_meta: DBResp = serde_json::from_str(&resp_meta).unwrap();
+        println!("Resp Payload: {}.", resp_payload.len());
+        println!("Resp Meta: {resp_meta:?}.");
+        match resp_meta {
+            DBResp::Ok => Ok(serde_json::from_slice(&resp_payload).unwrap()),
+            DBResp::Err(s) => Err(s),
+        }
+    }
+}
+
+impl KVClient {
+    /// New client.
+    pub async fn new(db_id: Option<usize>, caller_mem: Option<i32>) -> Self {
+        let db_id = db_id.unwrap_or(0);
+        let caller_mem = caller_mem.or(Some(512));
+        let fc = FunctionalClient::new("csqlite", "rkvactor", Some(db_id), caller_mem).await;
+        KVClient { fc: Arc::new(fc) }
+    }
+
+    pub async fn txn(
+        &self,
+        conditions: Vec<(String, Option<String>)>,
+        updates: Vec<(String, Option<String>)>,
+        reads: Vec<String>,
+    ) -> Result<Vec<Option<String>>, String> {
+        let kvtxn = KVTxn {
+            conditions,
+            updates,
+            reads,
+        };
+        let payload = serde_json::to_vec(&kvtxn).unwrap();
+        let (resp_meta, resp_payload) = self.fc.invoke("", &payload).await?;
+        let resp_meta: DBResp = serde_json::from_str(&resp_meta).unwrap();
+        println!("Resp Payload: {}.", resp_payload.len());
+        println!("Resp Meta: {resp_meta:?}.");
+        match resp_meta {
+            DBResp::Ok => Ok(serde_json::from_slice(&resp_payload).unwrap()),
+            DBResp::Err(s) => Err(s),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use obelisk::ServerlessStorage;
+    use std::time::Duration;
 
-    use super::DBClient;
+    use super::{DBClient, KVClient};
+    use crate::{
+        bench::{DATA_SIZE_KB, KEY_SIZE_B, NUM_KEYS, START_KEY, VAL_SIZE_B},
+        BenchFn,
+    };
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn simple_db_test() {
@@ -100,59 +137,166 @@ mod tests {
         let resp = dbcl.txn(vec![], vec![
             "REPLACE INTO keyvalues(key, value) VALUES ('Amadou0', 'Ngom0'), ('Amadou1', 'Ngom1');".into()
         ], Some(
-            "SELECT * FROM keyvalues;".into()
+            "SELECT * FROM keyvalues WHERE key='Amadou0';".into()
         )).await;
         println!("Resp: {resp:?}");
+        let resp = dbcl
+            .txn(
+                vec![],
+                vec!["DELETE FROM keyvalues WHERE key IN ('Amadou0', 'Amadou1');".into()],
+                Some("SELECT * FROM keyvalues WHERE key='Amadou0';".into()),
+            )
+            .await;
         println!("Resp: {resp:?}");
     }
 
-
-    /// This is just to check if the `unsafe` use of sqlite connections works.
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-    async fn concurrent_st_test() {
-        run_concurrent_st_test().await;
+    async fn simple_scaling_test() {
+        run_simple_scaling_test().await;
     }
 
-    async fn run_concurrent_st_test() {
-        let shared_dir = obelisk::common::shared_storage_prefix();
-        let identifier = "essai";
-        let storage_dir = format!("{shared_dir}/csqlite/{identifier}");
-        let _ = std::fs::remove_dir_all(&storage_dir);
-        let _res = std::fs::create_dir_all(&storage_dir).unwrap();
-        let pool = ServerlessStorage::try_exclusive_file(&storage_dir, 2).unwrap();
-        {
-            let conn = pool.get().unwrap();
-            conn.execute("CREATE TABLE IF NOT EXISTS essai (key INT PRIMARY KEY)", []).unwrap();
+    async fn run_simple_scaling_test() {
+        // Large mem to force scale up.
+        let dbcl = DBClient::new(Some(0), Some(20000)).await;
+        for _ in 0..10000 {
+            let resp = dbcl.txn(vec![], vec![
+                "REPLACE INTO keyvalues(key, value) VALUES ('Amadou0', 'Ngom0'), ('Amadou1', 'Ngom1');".into()
+            ], Some(
+                "SELECT * FROM keyvalues WHERE key='Amadou0';".into()
+            )).await;
+            println!("Resp: {resp:?}");
         }
-        {
-            let pool = pool.clone();
-            tokio::task::spawn_blocking(move || {
-                let mut conn = {
-                    let conn = pool.get().unwrap();
-                    unsafe {
-                        let handle = conn.handle();
-                        rusqlite::Connection::from_handle(handle).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn datagen_test() {
+        run_datagen_test().await;
+    }
+
+    async fn run_datagen_test() {
+        let reset = false;
+        let dbcl = DBClient::new(Some(0), Some(2048)).await;
+        let start_key = START_KEY; // Large enough to guarantee same key size.
+        let key_size_b: usize = KEY_SIZE_B;
+        let val_size_b: usize = VAL_SIZE_B;
+        if reset {
+            let start_time = std::time::Instant::now();
+            let data_size_kb: usize = DATA_SIZE_KB; // Approx ~20GB.
+            let num_keys = data_size_kb / ((val_size_b + key_size_b) * 1000); // Approx.
+            let batch_size: usize = (4 * 1000) / ((val_size_b + key_size_b) * 1000); // 4MB
+            let end_key = start_key + num_keys;
+            let mut i: usize = start_key;
+            while i < end_key {
+                let batch_start = i;
+                let batch_end = batch_start + batch_size;
+                println!("Batch: ({batch_start}, {batch_end}).");
+                let keyvals = (batch_start..batch_end)
+                    .map(|k| BenchFn::make_key_val(k, key_size_b, val_size_b))
+                    .collect::<Vec<_>>();
+                let updates = keyvals
+                    .into_iter()
+                    .map(|(k, v)| format!("REPLACE INTO keyvalues VALUES ('{k}', '{v}');"))
+                    .collect::<Vec<_>>();
+                loop {
+                    let r = dbcl.txn(vec![], updates.clone(), None).await;
+                    if r.is_ok() {
+                        println!("Ok.");
+                        break;
+                    } else {
+                        println!("Err: {r:?}. Retrying.");
                     }
-                };
-                println!("Getting Write Conn!");
-                println!("Got Write Conn!");
-                let txn = conn.transaction().unwrap();
-                let res = txn.execute("REPLACE INTO essai VALUES (37)", []).unwrap();
-                println!("Insert res: {res:?}.");
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                txn.commit().unwrap();
-            });
+                }
+                i += batch_size;
+            }
+            let end_time = std::time::Instant::now();
+            let duration = end_time.duration_since(start_time);
+            println!("Gen Duration: {duration:?}");
         }
-        {
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            let pool = pool.clone();
-            tokio::task::block_in_place(move || {
-                println!("Getting Read Conn!");
-                let conn = pool.get().unwrap();
-                println!("Got Read Conn!");
-                let res = conn.query_row("SELECT * FROM essai LIMIT 1", [], |r| r.get::<usize, usize>(0)).unwrap();
-                println!("Select res: {res:}");    
-            });
+        let (key, _) = BenchFn::make_key_val(start_key + 37, key_size_b, val_size_b);
+        let resp = dbcl
+            .txn(
+                vec![],
+                vec![],
+                Some(format!("SELECT * FROM keyvalues WHERE key='{key}';")),
+            )
+            .await;
+        println!("Resp: {resp:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn simple_kv_test() {
+        run_simple_kv_test().await;
+    }
+
+    async fn run_simple_kv_test() {
+        let kvcl = KVClient::new(Some(0), Some(512)).await;
+        let resp = kvcl
+            .txn(
+                vec![],
+                vec![
+                    ("Amadou0".into(), Some("Ngom0".into())),
+                    ("Amadou1".into(), Some("Ngom1".into())),
+                ],
+                vec!["Amadou0".into(), "Amadou1".into()],
+            )
+            .await;
+        println!("Resp: {resp:?}");
+        let resp = kvcl
+            .txn(
+                vec![],
+                vec![("Amadou0".into(), None)],
+                vec!["Amadou0".into(), "Amadou1".into()],
+            )
+            .await;
+        println!("Resp: {resp:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    async fn kv_datagen_test() {
+        run_kv_datagen_test().await;
+    }
+
+    async fn run_kv_datagen_test() {
+        let reset = false;
+        let kvcl = KVClient::new(Some(0), Some(2048)).await;
+        let start_key = START_KEY; // Large enough to guarantee same key size.
+        let key_size_b: usize = KEY_SIZE_B;
+        let val_size_b: usize = VAL_SIZE_B;
+        if reset {
+            let start_time = std::time::Instant::now();
+            let num_keys = NUM_KEYS;
+            let batch_size: usize = (4 * 1000) / ((val_size_b + key_size_b) / 1000); // 4MB
+            let end_key = start_key + num_keys;
+            let mut i: usize = start_key;
+            while i < end_key {
+                let batch_start = i;
+                let batch_end = batch_start + batch_size;
+                println!("Batch: ({batch_start}, {batch_end}).");
+                let keyvals = (batch_start..batch_end)
+                    .map(|k| BenchFn::make_key_val(k, key_size_b, val_size_b))
+                    .collect::<Vec<_>>();
+                let updates = keyvals
+                    .into_iter()
+                    .map(|(k, v)| (k, Some(v)))
+                    .collect::<Vec<_>>();
+                loop {
+                    let r = kvcl.txn(vec![], updates.clone(), vec![]).await;
+                    if r.is_ok() {
+                        println!("Ok.");
+                        break;
+                    } else {
+                        println!("Err: {r:?}. Retrying.");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+                i += batch_size;
+            }
+            let end_time = std::time::Instant::now();
+            let duration = end_time.duration_since(start_time);
+            println!("Gen Duration: {duration:?}");
         }
+        let (key, _) = BenchFn::make_key_val(start_key + 37, key_size_b, val_size_b);
+        let resp = kvcl.txn(vec![], vec![], vec![key]).await;
+        println!("Resp: {resp:?}");
     }
 }

@@ -2,20 +2,42 @@ namespace = "csqlite"
 dependencies = ["wal", "functional"]
 
 
+# [[handlers]]
+# name = "dbactor"
+# subsystem = "functional"
+# path = "csqlite::CSqliteActor"
+# mem = 512
+# timeout = 30
+# persistent = true
+# unique = true
+# scaleup = true
+
 [[handlers]]
-name = "dbactor"
+name = "rkvactor"
 subsystem = "functional"
-path = "csqlite::CSqliteActor"
-mem = 512
+path = "csqlite::RKVActor"
+mem = 1769
 timeout = 30
 persistent = true
 unique = true
-scaleup = true
+scaleup = 1.0
+
 
 # [[handlers]]
-# name = "dbbench"
+# name = "skvactor"
 # subsystem = "functional"
-# path = "csqlite::CsqliteBench"
+# path = "csqlite::SKVActor"
 # mem = 512
-# timeout = 60
-# scaleup = false
+# timeout = 30
+# persistent = true
+# unique = true
+# scaleup = true
+
+[[handlers]]
+name = "dbbench"
+subsystem = "functional"
+path = "csqlite::BenchFn"
+mem = 512
+timeout = 60
+concurrency = 1
+scaleup = -1.0

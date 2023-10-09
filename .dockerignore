@@ -1,0 +1,7 @@
+**/target
+**/obelisk_shared_data
+**/figures
+*.ipynb
+**/venv
+**/*.zip
+
