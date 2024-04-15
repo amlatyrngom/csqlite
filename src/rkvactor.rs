@@ -1,19 +1,29 @@
 use super::client::{KVResp, KVTxn};
+use obelisk::persistence::PersistentLog;
 use obelisk::{HandlerKit, ScalingState, ServerlessHandler, ServerlessStorage};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 #[derive(Clone)]
 pub struct RKVActor {
     db: Arc<RwLock<Option<rocksdb::OptimisticTransactionDB>>>,
+    plog: Arc<PersistentLog>,
+    locked_keys: Arc<RwLock<HashSet<String>>>,
+}
+
+pub enum RKVOp {
+    Read { key: String },
+    Write { key: String, val: Option<String> },
 }
 
 #[async_trait::async_trait]
 impl ServerlessHandler for RKVActor {
     async fn handle(&self, _meta: String, payload: Vec<u8>) -> (String, Vec<u8>) {
         // TODO: If query too large, should put in payload.
-        let kvtxn: KVTxn = serde_json::from_slice(&payload).unwrap();
-        self.handle_req(kvtxn).await
+        let kvop: KVTxn = serde_json::from_slice(&payload).unwrap();
+        self.handle_req(kvop).await
     }
 
     async fn checkpoint(&self, _scaling_state: &ScalingState, terminating: bool) {
@@ -28,8 +38,14 @@ impl RKVActor {
     pub async fn new(kit: HandlerKit) -> Self {
         let HandlerKit {
             instance_info,
-            serverless_storage: _,
+            serverless_storage,
         } = kit;
+        let serverless_storage = serverless_storage.unwrap();
+        let plog = Arc::new(
+            PersistentLog::new(instance_info.clone(), serverless_storage.clone())
+                .await
+                .unwrap(),
+        );
         let storage_dir =
             ServerlessStorage::get_storage_dir("csqlite", &instance_info.identifier, false);
         let dbfile = format!("{storage_dir}/rkvactor.db");
@@ -64,7 +80,12 @@ impl RKVActor {
             std::process::exit(1);
         }
         let db = Arc::new(RwLock::new(db));
-        let structure = RKVActor { db };
+        let locked_keys = Arc::new(RwLock::new(HashSet::new()));
+        let structure = RKVActor {
+            db,
+            plog,
+            locked_keys,
+        };
         println!("Made KVActor: {}.", instance_info.identifier);
         structure
     }
@@ -77,26 +98,104 @@ impl RKVActor {
 
     /// Handle request.
     async fn handle_req(&self, kvtxn: KVTxn) -> (String, Vec<u8>) {
-        let (resp, rows) = self.execute(kvtxn).await;
+        let all_keys = kvtxn
+            .reads
+            .iter()
+            .chain(kvtxn.updates.iter().map(|(k, _)| k))
+            .chain(kvtxn.conditions.iter().map(|(k, _)| k))
+            .cloned()
+            .collect::<Vec<_>>();
+        {
+            let mut locked_keys = self.locked_keys.write().await;
+            for key in &all_keys {
+                if locked_keys.contains(key) {
+                    let resp = KVResp::Err("Concurrent key access.".into());
+                    let resp = serde_json::to_string(&resp).unwrap();
+                    return (resp, vec![]);
+                }
+            }
+            for key in &all_keys {
+                locked_keys.insert(key.clone());
+            }
+        }
+        let ((resp, rows), handle) = self.execute(kvtxn).await;
+        if let Some(handle) = handle {
+            let locked_keys = self.locked_keys.clone();
+            tokio::spawn(async move {
+                let r = handle.await;
+                if r.is_err() {
+                    eprintln!("RDB Handle Error: {r:?}");
+                    std::process::exit(1);
+                }
+                let mut locked_keys = locked_keys.write().await;
+                for key in all_keys {
+                    locked_keys.remove(&key);
+                }
+            });
+        } else {
+            let mut locked_keys = self.locked_keys.write().await;
+            for key in all_keys {
+                locked_keys.remove(&key);
+            }
+        }
         (serde_json::to_string(&resp).unwrap(), rows)
     }
 
     /// Execute a transaction.
-    pub async fn execute(&self, kvtxn: KVTxn) -> (KVResp, Vec<u8>) {
+    pub async fn execute(
+        &self,
+        kvtxn: KVTxn,
+    ) -> (
+        (KVResp, Vec<u8>),
+        Option<JoinHandle<(KVResp, Vec<Option<String>>)>>,
+    ) {
         let db = self.db.clone();
         let db = db.read_owned().await;
-        let (resp, data) = tokio::task::spawn_blocking(move || {
+        let read_only = kvtxn.updates.is_empty() && kvtxn.conditions.is_empty();
+        let write_only = kvtxn.reads.is_empty() && kvtxn.conditions.is_empty();
+        let use_log = write_only && !kvtxn.for_data_load;
+        if use_log {
+            let plog = self.plog.clone();
+            let log_entry = bincode::serialize(&kvtxn).unwrap();
+            let lsn = plog.enqueue(log_entry, Some(kvtxn.caller_mem)).await;
+            plog.flush_at(Some(lsn)).await;
+        }
+        let handle = tokio::task::spawn_blocking(move || {
             let db: Option<_> = db.as_ref();
             if db.is_none() {
                 return (KVResp::Err("KV Terminating!".into()), vec![]);
             }
             let db = db.unwrap();
-            Self::read_write_txn(db, &kvtxn)
-        })
-        .await
-        .unwrap();
+            if read_only {
+                Self::read_only_txn(db, &kvtxn)
+            } else if !use_log {
+                Self::read_write_txn(db, &kvtxn)
+            } else {
+                for _ in 0..10 {
+                    let (resp, data) = Self::read_write_txn(db, &kvtxn);
+                    match &resp {
+                        KVResp::Ok => return (resp, data),
+                        KVResp::Err(e) => {
+                            if e.contains("False Condition") {
+                                return (resp, data);
+                            }
+                            println!("RDB retrying txn due to unexpected error: {e:?}.");
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                }
+                eprintln!("RDB Retried too many times. Exiting.");
+                std::process::exit(1);
+            }
+        });
+        let (resp, data, handle) = if !use_log {
+            let (resp, data) = handle.await.unwrap();
+            (resp, data, None)
+        } else {
+            (KVResp::Ok, vec![], Some(handle))
+        };
         let data = serde_json::to_vec(&data).unwrap();
-        (resp, data)
+        ((resp, data), handle)
     }
 
     fn read_only_txn(
@@ -107,7 +206,10 @@ impl RKVActor {
         let mut results = Vec::new();
         for val in gets {
             match val {
-                Err(e) => return (KVResp::Err(format!("{e:?}")), vec![]),
+                Err(e) => {
+                    println!("Unexpected RDB Read Error: {e:?}");
+                    return (KVResp::Err(format!("{e:?}")), vec![]);
+                }
                 Ok(val) => {
                     results.push(val.map(|v| String::from_utf8(v).unwrap()));
                 }
@@ -121,17 +223,16 @@ impl RKVActor {
         db: &rocksdb::OptimisticTransactionDB,
         kvtxn: &KVTxn,
     ) -> (KVResp, Vec<Option<String>>) {
-        if kvtxn.updates.is_empty() && kvtxn.conditions.is_empty() {
-            return Self::read_only_txn(db, kvtxn);
-        }
-
         let mut wopt = rocksdb::WriteOptions::default();
         wopt.set_sync(true);
         let txnopt = rocksdb::OptimisticTransactionOptions::default();
         let txn = db.transaction_opt(&wopt, &txnopt);
         for (condkey, condval) in &kvtxn.conditions {
             match txn.get(condkey.as_bytes()) {
-                Err(e) => return (KVResp::Err(format!("{e:?}")), vec![]),
+                Err(e) => {
+                    eprintln!("Unexpected Error: {e:?}");
+                    return (KVResp::Err(format!("{e:?}")), vec![]);
+                }
                 Ok(actualval) => {
                     let actualval = actualval.as_ref().map(|v| v.as_slice());
                     if actualval != condval.as_ref().map(|s| s.as_bytes()) {
@@ -145,12 +246,18 @@ impl RKVActor {
         for (key, val) in &kvtxn.updates {
             if let Some(val) = val {
                 match txn.put(key.as_bytes(), val.as_bytes()) {
-                    Err(e) => return (KVResp::Err(format!("{e:?}")), vec![]),
+                    Err(e) => {
+                        eprintln!("Unexpected Error: {e:?}");
+                        std::process::exit(1);
+                    }
                     Ok(_) => {}
                 }
             } else {
                 match txn.delete(key.as_bytes()) {
-                    Err(e) => return (KVResp::Err(format!("{e:?}")), vec![]),
+                    Err(e) => {
+                        eprintln!("Unexpected Error: {e:?}");
+                        std::process::exit(1);
+                    }
                     Ok(_) => {}
                 }
             }
@@ -159,7 +266,10 @@ impl RKVActor {
         let mut results = Vec::new();
         for key in &kvtxn.reads {
             match txn.get(key.as_bytes()) {
-                Err(e) => return (KVResp::Err(format!("{e:?}")), vec![]),
+                Err(e) => {
+                    eprintln!("Unexpected Error: {e:?}");
+                    std::process::exit(1);
+                }
                 Ok(val) => {
                     results.push(val.map(|v| String::from_utf8(v).unwrap()));
                 }
@@ -167,7 +277,10 @@ impl RKVActor {
         }
         // Do Commit.
         match txn.commit() {
-            Err(e) => return (KVResp::Err(format!("{e:?}")), vec![]),
+            Err(e) => {
+                eprintln!("Unexpected Error: {e:?}");
+                std::process::exit(1);
+            }
             Ok(_) => (KVResp::Ok, results),
         }
     }
@@ -179,10 +292,7 @@ mod tests {
 
     use obelisk::{HandlerKit, InstanceInfo, ServerlessStorage};
 
-    use crate::{
-        client::{KVResp, KVTxn},
-        RKVActor,
-    };
+    use crate::{client::KVTxn, RKVActor};
 
     async fn make_test_actor_kit(reset: bool) -> HandlerKit {
         if reset {
@@ -233,6 +343,8 @@ mod tests {
                     ("Amadou1".into(), Some("Ngom1".into())),
                 ],
                 reads: vec!["Amadou0".into()],
+                for_data_load: false,
+                caller_mem: 512,
             })
             .await;
         println!("Resp: {resp:?}");
@@ -246,6 +358,8 @@ mod tests {
                     ("Amadou1".into(), Some("Ngom1".into())),
                 ],
                 reads: vec!["Amadou0".into()],
+                for_data_load: false,
+                caller_mem: 512,
             })
             .await;
         println!("Resp: {resp:?}");
@@ -264,52 +378,52 @@ mod tests {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
-    async fn simple_bench_test() {
-        run_simple_bench_test().await;
-    }
+    // #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
+    // async fn simple_bench_test() {
+    //     run_simple_bench_test().await;
+    // }
 
-    async fn run_simple_bench_test() {
-        let kit = make_test_actor_kit(true).await;
-        let actor = Arc::new(RKVActor::new(kit).await);
-        let txn1 = KVTxn {
-            conditions: vec![],
-            updates: vec![
-                // ("Amadou0".into(), Some("Ngom0".into())),
-            ],
-            reads: vec!["Amadou0".into()],
-        };
-        let txn2 = KVTxn {
-            conditions: vec![],
-            updates: vec![
-                // ("Amadou1".into(), Some("Ngom1".into())),
-            ],
-            reads: vec!["Amadou0".into()],
-        };
-        let mut ts = Vec::new();
-        let ops_per_thread = 400;
-        let num_threads = 8; // Some decent number.
-        let mut txns = Vec::new();
-        for _ in 0..(num_threads / 2) {
-            txns.push(txn1.clone());
-            txns.push(txn2.clone());
-        }
-        for (i, txn) in txns.into_iter().enumerate() {
-            let actor = actor.clone();
-            ts.push(tokio::spawn(async move {
-                let start_time = std::time::Instant::now();
-                for _ in 0..ops_per_thread {
-                    let _resp = actor.handle_req(txn.clone()).await;
-                }
-                let end_time = std::time::Instant::now();
-                let duration = end_time.duration_since(start_time);
-                println!("Thread {i}. Duration={duration:?}.");
-            }));
-        }
-        for t in ts {
-            let _ = t.await;
-        }
-    }
+    // async fn run_simple_bench_test() {
+    //     let kit = make_test_actor_kit(true).await;
+    //     let actor = Arc::new(RKVActor::new(kit).await);
+    //     let txn1 = KVTxn {
+    //         conditions: vec![],
+    //         updates: vec![
+    //             // ("Amadou0".into(), Some("Ngom0".into())),
+    //         ],
+    //         reads: vec!["Amadou0".into()],
+    //     };
+    //     let txn2 = KVTxn {
+    //         conditions: vec![],
+    //         updates: vec![
+    //             // ("Amadou1".into(), Some("Ngom1".into())),
+    //         ],
+    //         reads: vec!["Amadou0".into()],
+    //     };
+    //     let mut ts = Vec::new();
+    //     let ops_per_thread = 400;
+    //     let num_threads = 8; // Some decent number.
+    //     let mut txns = Vec::new();
+    //     for _ in 0..(num_threads / 2) {
+    //         txns.push(txn1.clone());
+    //         txns.push(txn2.clone());
+    //     }
+    //     for (i, txn) in txns.into_iter().enumerate() {
+    //         let actor = actor.clone();
+    //         ts.push(tokio::spawn(async move {
+    //             let start_time = std::time::Instant::now();
+    //             for _ in 0..ops_per_thread {
+    //                 let _resp = actor.handle_req(txn.clone()).await;
+    //             }
+    //             let end_time = std::time::Instant::now();
+    //             let duration = end_time.duration_since(start_time);
+    //             println!("Thread {i}. Duration={duration:?}.");
+    //         }));
+    //     }
+    //     for t in ts {
+    //         let _ = t.await;
+    //     }
+    // }
 
     // #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     // async fn datagen_test() {

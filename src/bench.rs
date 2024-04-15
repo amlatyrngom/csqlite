@@ -1,6 +1,6 @@
 use obelisk::{HandlerKit, ScalingState, ServerlessHandler};
 
-use crate::client::{DBClient, KVClient};
+use crate::client::KVClient;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -57,7 +57,7 @@ impl BenchFn {
         for key in rkeys {
             let (key, _val) = Self::make_key_val(key, KEY_SIZE_B, VAL_SIZE_B);
             let start_time = std::time::Instant::now();
-            let resp = self.kvcl.txn(vec![], vec![], vec![key]).await;
+            let resp = self.kvcl.txn(vec![], vec![], vec![key], false).await;
             let end_time = std::time::Instant::now();
             let duration = end_time.duration_since(start_time);
             if resp.is_ok() {
@@ -68,7 +68,10 @@ impl BenchFn {
         for key in wkeys {
             let (key, val) = Self::make_key_val(key, KEY_SIZE_B, VAL_SIZE_B);
             let start_time = std::time::Instant::now();
-            let resp = self.kvcl.txn(vec![], vec![(key, Some(val))], vec![]).await;
+            let resp = self
+                .kvcl
+                .txn(vec![], vec![(key, Some(val))], vec![], false)
+                .await;
             let end_time = std::time::Instant::now();
             let duration = end_time.duration_since(start_time);
             if resp.is_ok() {
@@ -120,12 +123,12 @@ mod tests {
         writer.flush().unwrap();
     }
 
-    #[derive(Debug)]
-    enum RequestRate {
-        Low,
-        Medium,
-        High(usize),
-    }
+    // #[derive(Debug)]
+    // enum RequestRate {
+    //     Low,
+    //     Medium,
+    //     High(usize),
+    // }
 
     #[derive(Debug, Clone)]
     enum RequestPattern {
@@ -143,7 +146,7 @@ mod tests {
                 let mut rng = rand::thread_rng();
                 let zipf = zipf::ZipfDistribution::new(NUM_KEYS, 0.5).unwrap();
                 let keys = (0..per_request_count)
-                    .map(|i| {
+                    .map(|_| {
                         START_KEY + zipf.sample(&mut rng) - 1 // Starts from 1.
                     })
                     .collect();
@@ -275,7 +278,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn full_bench_test() {
         let fc = Arc::new(FunctionalClient::new("csqlite", "dbbench", None, Some(512)).await);
-        let duration_mins = 1.0;
+        let duration_mins = 5.0;
         let low_req_per_secs = 2.0;
         let medium_req_per_secs = 40.0;
         let high_req_per_secs = 400.0;
@@ -285,30 +288,30 @@ mod tests {
             pattern: RequestPattern::Zipf(true),
             fc: fc.clone(),
         };
-        // Low
-        request_sender.desired_requests_per_second = low_req_per_secs;
+        // // Low
+        // request_sender.desired_requests_per_second = low_req_per_secs;
+        // run_bench(
+        //     &mut request_sender,
+        //     "pre_low",
+        //     Duration::from_secs_f64(60.0 * duration_mins),
+        // )
+        // .await;
+        // Medium
+        request_sender.desired_requests_per_second = medium_req_per_secs;
         run_bench(
             &mut request_sender,
-            "pre_low",
+            "pre_medium",
             Duration::from_secs_f64(60.0 * duration_mins),
         )
         .await;
-        // // Medium
-        // request_sender.desired_requests_per_second = medium_req_per_secs;
-        // run_bench(
-        //     &mut request_sender,
-        //     "pre_medium",
-        //     Duration::from_secs_f64(60.0 * duration_mins),
-        // )
-        // .await;
-        // // High
-        // request_sender.desired_requests_per_second = high_req_per_secs;
-        // run_bench(
-        //     &mut request_sender,
-        //     "pre_high",
-        //     Duration::from_secs_f64(60.0 * duration_mins),
-        // )
-        // .await;
+        // High
+        request_sender.desired_requests_per_second = high_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "pre_high",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
         // // Low again.
         // request_sender.desired_requests_per_second = low_req_per_secs;
         // run_bench(

@@ -19,7 +19,7 @@ r2d2_sqlite = "*"
 # sled = "*"
 
 [dependencies.rocksdb]
-version = "0.21"
+version = "0.22"
 default-features = false
 features = ["lz4", "multi-threaded-cf"]
 

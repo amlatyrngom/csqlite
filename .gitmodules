@@ -1,4 +1,4 @@
 [submodule "obelisk"]
 	path = obelisk
 	url = https://github.com/amlatyrngom/obelisk.git
-	branch = postpaper
+	branch = proactive
