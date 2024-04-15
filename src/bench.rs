@@ -54,6 +54,7 @@ impl BenchFn {
     async fn handle_request(&self, rkeys: Vec<usize>, wkeys: Vec<usize>) -> (String, Vec<u8>) {
         let mut durations = Vec::new();
         // Read keys.
+        let mut erred = false;
         for key in rkeys {
             let (key, _val) = Self::make_key_val(key, KEY_SIZE_B, VAL_SIZE_B);
             let start_time = std::time::Instant::now();
@@ -62,6 +63,9 @@ impl BenchFn {
             let duration = end_time.duration_since(start_time);
             if resp.is_ok() {
                 durations.push((duration, String::from("Read")));
+            } else {
+                // Early exit in case of error. Makes benchmark more robust.
+                return (serde_json::to_string(&durations).unwrap(), vec![]);
             }
         }
         // Write keys.
@@ -76,6 +80,9 @@ impl BenchFn {
             let duration = end_time.duration_since(start_time);
             if resp.is_ok() {
                 durations.push((duration, String::from("Write")));
+            } else {
+                // Early exit in case of error. Makes benchmark more robust.
+                return (serde_json::to_string(&durations).unwrap(), vec![]);
             }
         }
         (serde_json::to_string(&durations).unwrap(), vec![])
@@ -238,6 +245,8 @@ mod tests {
                 });
             if all_responses.len() > 0 {
                 avg_req_latency = avg_req_latency.div_f64(all_responses.len() as f64);
+            } else {
+                return all_responses;
             }
             println!(
                 "AVG_LATENCY={avg_duration}; CURR_AVG_LATENCY={}; REQ_LATENCY={avg_req_latency:?}",
@@ -267,9 +276,14 @@ mod tests {
                 break;
             }
             let since = since.as_millis() as u64;
-            let resp = resquest_sender.send_request_window().await;
-            for (duration, op_type) in resp {
-                results.push((since, duration.as_secs_f64(), op_type));
+            // Cancel after max duration.
+            let max_duration = 1.1 * 5.0;
+            let handle = resquest_sender.send_request_window();
+            let resp = tokio::time::timeout(Duration::from_secs_f64(max_duration), handle).await;
+            if let Ok(resp) = resp {
+                for (duration, op_type) in resp {
+                    results.push((since, duration.as_secs_f64(), op_type));
+                }
             }
         }
         write_bench_output(results, &format!("{name}")).await;
@@ -288,14 +302,14 @@ mod tests {
             pattern: RequestPattern::Zipf(true),
             fc: fc.clone(),
         };
-        // // Low
-        // request_sender.desired_requests_per_second = low_req_per_secs;
-        // run_bench(
-        //     &mut request_sender,
-        //     "pre_low",
-        //     Duration::from_secs_f64(60.0 * duration_mins),
-        // )
-        // .await;
+        // Low
+        request_sender.desired_requests_per_second = low_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "pre_low",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
         // Medium
         request_sender.desired_requests_per_second = medium_req_per_secs;
         run_bench(
@@ -312,13 +326,13 @@ mod tests {
             Duration::from_secs_f64(60.0 * duration_mins),
         )
         .await;
-        // // Low again.
-        // request_sender.desired_requests_per_second = low_req_per_secs;
-        // run_bench(
-        //     &mut request_sender,
-        //     "post_low",
-        //     Duration::from_secs_f64(60.0 * duration_mins),
-        // )
-        // .await;
+        // Low again.
+        request_sender.desired_requests_per_second = low_req_per_secs;
+        run_bench(
+            &mut request_sender,
+            "post_low",
+            Duration::from_secs_f64(60.0 * duration_mins),
+        )
+        .await;
     }
 }
